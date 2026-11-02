@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Polymarket watch</title>
+<style>
+  :root { --page: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink2: #52514e; --muted: #898781; --line: #e6e5e1; }
+  body { margin: 0; background: var(--page); color: var(--ink); font: 15px/1.4 system-ui, sans-serif; }
+  header, main { max-width: 1000px; margin: 0 auto; padding: 16px; }
+  header { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; }
+  h1 { font-size: 20px; margin: 0; flex-basis: 100%; }
+  form { display: flex; gap: 8px; flex: 1 1 360px; }
+  input { flex: 1; min-width: 0; padding: 6px 8px; font: inherit; }
+  button { font: inherit; padding: 6px 10px; cursor: pointer; }
+  [aria-pressed="true"] { background: var(--ink); color: var(--surface); }
+  #msg { flex-basis: 100%; margin: 0; color: var(--ink2); min-height: 1.4em; }
+  section { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+  .top { display: flex; justify-content: space-between; align-items: start; gap: 12px; }
+  h2 { font-size: 17px; margin: 0; }
+  h2 a { color: inherit; }
+  .plot { position: relative; height: 320px; margin: 12px 0; }
+  ul { list-style: none; padding: 0; margin: 0; columns: 2 240px; color: var(--ink2); }
+  li { break-inside: avoid; padding: 2px 0; }
+  li i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; }
+  li b { color: var(--ink); font-weight: 600; }
+  details { margin-top: 8px; color: var(--ink2); }
+  details button { margin: 4px 4px 0 0; }
+  .err { color: #d03b3b; }
+</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"
+        integrity="sha512-CQBWl4fJHWbryGE+Pc7UAxWMUMNMWzWxF4SQo9CgkJIN1kx6djDQZjh3Y8SZ1d+6I+1zze6Z7kHXO7q3UyZAWw=="
+        crossorigin="anonymous"></script>
+<script src="lib.js"></script>
+</head>
+<body>
+<header>
+  <h1>Polymarket watch</h1>
+  <form id="add">
+    <input id="url" aria-label="Event link" placeholder="Paste a polymarket.com/event/… link">
+    <button>Add</button>
+  </form>
+  <div role="group" aria-label="Time range">
+    <button data-r="1d" aria-pressed="false">1 day</button>
+    <button data-r="1w" aria-pressed="true">1 week</button>
+    <button data-r="1m" aria-pressed="false">1 month</button>
+  </div>
+  <button id="refresh">Refresh</button>
+  <p id="msg" role="status"></p>
+</header>
+<main id="events"></main>
+<script>
+const GAMMA = 'https://gamma-api.polymarket.com', CLOB = 'https://clob.polymarket.com';
+const DEFAULTS = [
+  'who-will-be-the-next-prime-minister-of-israel-after-the-next-election',
+  'israel-x-iran-ceasefire-continues-throughptptpt-20260716224448963',
+];
+const FIDELITY = { '1d': 10, '1w': 60, '1m': 240 }; // minutes per history point
+const TICK = { '1d': 3 * 3600e3, '1w': 86400e3, '1m': 7 * 86400e3 }; // x-axis tick step, ms
+// dataviz reference palette: categorical in fixed order (9th+ series go gray, never cycled);
+// date ladders use the blue ramp 700 -> 250, near dates dark.
+const CATEGORICAL = ['#2a78d6', '#eb6834', '#1baf7a', '#eda100', '#e87ba4', '#008300', '#6250d6', '#e34948'];
+const RAMP = ['#0d366b', '#104281', '#184f95', '#1c5cab', '#256abf', '#2a78d6', '#3987e5', '#5598e7', '#6da7ec', '#86b6ef'];
+const MUTED = '#898781', GRID = '#ecebe7', INK2 = '#52514e';
+
+const main = document.getElementById('events'), msg = document.getElementById('msg');
+const input = document.getElementById('url');
+let range = '1w', slugs = load();
+
+function load() { try { return JSON.parse(localStorage.getItem('pm.events')) || DEFAULTS; } catch { return DEFAULTS; } }
+function save() { try { localStorage.setItem('pm.events', JSON.stringify(slugs)); } catch {} }
+
+async function getJSON(url) {
+  const r = await fetch(url).catch(() => { throw new Error('Could not reach Polymarket.'); });
+  if (!r.ok) throw new Error(`Polymarket API error ${r.status}`);
+  return r.json();
+}
+const history = (token) =>
+  getJSON(`${CLOB}/prices-history?market=${token}&interval=${range}&fidelity=${FIDELITY[range]}`).then((d) => d.history || []);
+
+const pct = (p) => (p * 100).toFixed(1) + '%';
+const fmt = (ms, opts) => new Date(ms).toLocaleString([], opts);
+
+function rampColor(f) { // f in [0,1] along RAMP, mixed between neighbouring steps
+  const x = f * (RAMP.length - 1), i = Math.min(Math.floor(x), RAMP.length - 2), w = x - i;
+  const [a, b] = [RAMP[i], RAMP[i + 1]].map((h) => [1, 3, 5].map((k) => parseInt(h.slice(k, k + 2), 16)));
+  return `rgb(${a.map((v, k) => Math.round(v + (b[k] - v) * w))})`;
+}
+
+// Hover: nearest point of every visible line (series have their own timestamps, so 'index' mode won't align).
+Chart.Interaction.modes.eachNearest = (chart, e) => {
+  const { x } = Chart.helpers.getRelativePosition(e, chart);
+  return chart.getSortedVisibleDatasetMetas().flatMap((meta) => {
+    let best = -1;
+    meta.data.forEach((el, i) => { if (best < 0 || Math.abs(el.x - x) < Math.abs(meta.data[best].x - x)) best = i; });
+    return best < 0 ? [] : [{ element: meta.data[best], datasetIndex: meta.index, index: best }];
+  });
+};
+
+function newChart(canvas) {
+  return new Chart(canvas, {
+    type: 'line',
+    data: { datasets: [] },
+    options: {
+      maintainAspectRatio: false,
+      animation: false,
+      interaction: { mode: 'eachNearest', intersect: false },
+      elements: { point: { radius: 0, hoverRadius: 4 }, line: { borderWidth: 2 } },
+      scales: {
+        x: {
+          type: 'linear', bounds: 'data', grid: { color: GRID },
+          afterBuildTicks: (s) => { // round local hours/days; Chart.js would start at the first data point
+            const step = TICK[range], tz = new Date().getTimezoneOffset() * 60e3;
+            s.ticks = [];
+            for (let v = Math.ceil((s.min - tz) / step) * step + tz; v <= s.max; v += step) s.ticks.push({ value: v });
+          },
+          ticks: {
+            maxRotation: 0, color: MUTED,
+            callback: (v) => fmt(v, range === '1d' ? { hour: '2-digit', minute: '2-digit' } : { day: 'numeric', month: 'short' }),
+          },
+        },
+        y: { beginAtZero: true, grid: { color: GRID }, ticks: { color: MUTED, callback: (v) => v + '%' } },
+      },
+      plugins: {
+        legend: { labels: { boxWidth: 10, boxHeight: 10, color: INK2 } },
+        tooltip: {
+          itemSort: (a, b) => b.parsed.y - a.parsed.y,
+          callbacks: {
+            title: (items) => fmt(items[0].parsed.x, { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }),
+            label: (it) => ` ${it.dataset.label}: ${it.parsed.y.toFixed(1)}%`,
+          },
+        },
+      },
+    },
+  });
+}
+
+function renderAll() {
+  main.querySelectorAll('canvas').forEach((c) => Chart.getChart(c)?.destroy());
+  main.replaceChildren();
+  slugs.forEach(renderEvent);
+  msg.textContent = `Loaded ${fmt(Date.now(), { hour: '2-digit', minute: '2-digit' })}`;
+}
+
+async function renderEvent(slug) {
+  const card = document.createElement('section');
+  const stale = () => !card.isConnected; // removed by X or replaced by a re-render: drop in-flight results
+  card.innerHTML = '<div class="top"><h2></h2><button class="x">✕</button></div>';
+  const h2 = card.querySelector('h2'), x = card.querySelector('.x');
+  h2.textContent = `Loading ${slug}…`;
+  x.setAttribute('aria-label', `Remove ${slug}`);
+  let chart;
+  x.onclick = () => { slugs = slugs.filter((s) => s !== slug); save(); card.remove(); chart?.destroy(); };
+  main.append(card);
+  const note = (text, cls = '') => card.append(Object.assign(document.createElement('p'), { textContent: text, className: cls }));
+
+  try {
+    const [ev] = await getJSON(`${GAMMA}/events?slug=${encodeURIComponent(slug)}`);
+    if (stale()) return;
+    if (!ev) throw new Error('Event not found. Check the link.');
+    h2.replaceChildren(Object.assign(document.createElement('a'),
+      { href: `https://polymarket.com/event/${slug}`, target: '_blank', rel: 'noopener', textContent: ev.title }));
+    x.setAttribute('aria-label', `Remove ${ev.title}`);
+
+    const { shown, hidden, ladder } = pickMarkets(ev);
+    if (!shown.length && !hidden.length) return note('All markets in this event are resolved.');
+
+    const plot = Object.assign(document.createElement('div'), { className: 'plot' });
+    const canvas = document.createElement('canvas');
+    canvas.setAttribute('role', 'img');
+    canvas.setAttribute('aria-label', `Chart: ${ev.title} — current values are listed below it`);
+    plot.append(canvas);
+    const list = document.createElement('ul');
+    card.append(plot, list);
+
+    let failed = 0;
+    const histories = await Promise.all(shown.map((m) => history(m.token).catch(() => (failed++, []))));
+    if (stale()) return;
+    chart = newChart(canvas);
+
+    const addLine = (m, hist, color) => {
+      chart.data.datasets.push({
+        label: m.label, data: hist.map((h) => ({ x: h.t * 1000, y: h.p * 100 })),
+        borderColor: color, backgroundColor: color,
+      });
+      const c = change24h(hist, m.price), d = c == null ? 0 : Math.round(c * 1000) / 10; // -0.04 -> +0.0, not -0.0
+      const li = document.createElement('li');
+      li.innerHTML = '<i aria-hidden="true"></i><b></b> <span></span>';
+      li.querySelector('i').style.background = color;
+      li.querySelector('b').textContent = m.label;
+      li.querySelector('span').textContent = `${pct(m.price)}, ` +
+        (c == null ? 'no 24h history' : `${d >= 0 ? '+' : '-'}${Math.abs(d).toFixed(1)} pts in 24h`);
+      list.append(li);
+    };
+    shown.forEach((m, i) => addLine(m, histories[i],
+      ladder ? rampColor(shown.length > 1 ? i / (shown.length - 1) : 0) : CATEGORICAL[i] || MUTED));
+    chart.update();
+    if (failed) note(`Price history didn't load for ${failed} of ${shown.length} markets. Try Refresh.`, 'err');
+
+    if (hidden.length) {
+      const d = document.createElement('details');
+      d.innerHTML = `<summary>${hidden.length} more under 1%</summary>`;
+      for (const m of hidden) {
+        const b = document.createElement('button');
+        b.textContent = `${m.label} ${pct(m.price)}`;
+        b.onclick = async () => {
+          b.disabled = true;
+          const hist = await history(m.token).catch(() => null);
+          if (stale()) return;
+          if (!hist) {
+            b.disabled = false;
+            msg.textContent = `Couldn't load ${m.label}. Try again.`;
+            return;
+          }
+          // ponytail: ladder add-ons go gray at the end, not re-sorted into the ramp (only ladders with <1% dates hit this)
+          addLine(m, hist, ladder ? MUTED : CATEGORICAL[chart.data.datasets.length] || MUTED);
+          chart.update();
+          b.remove();
+          const left = d.querySelectorAll('button').length;
+          if (left) d.querySelector('summary').textContent = `${left} more under 1%`;
+          else d.remove();
+        };
+        d.append(b);
+      }
+      card.append(d);
+    }
+  } catch (e) {
+    if (stale()) return;
+    if (!h2.firstElementChild) h2.textContent = slug; // drop "Loading…" when the title never arrived
+    note(e.message, 'err');
+  }
+}
+
+document.getElementById('add').onsubmit = (e) => {
+  e.preventDefault();
+  const slug = slugFromInput(input.value);
+  if (!slug) return void (msg.textContent = 'Paste a Polymarket event link, like polymarket.com/event/…');
+  if (slugs.includes(slug)) return void (msg.textContent = 'That event is already on the page.');
+  slugs.push(slug);
+  save();
+  input.value = '';
+  msg.textContent = '';
+  renderEvent(slug);
+};
+for (const b of document.querySelectorAll('[data-r]')) b.onclick = () => {
+  range = b.dataset.r;
+  document.querySelectorAll('[data-r]').forEach((o) => o.setAttribute('aria-pressed', o === b));
+  renderAll();
+};
+document.getElementById('refresh').onclick = renderAll;
+renderAll();
+</script>
+</body>
+</html>
