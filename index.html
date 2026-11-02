@@ -16,8 +16,8 @@
   [aria-pressed="true"] { background: var(--ink); color: var(--surface); }
   #msg { flex-basis: 100%; margin: 0; color: var(--ink2); min-height: 1.4em; }
   section { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
-  .top { display: flex; justify-content: space-between; align-items: start; gap: 12px; }
-  h2 { font-size: 17px; margin: 0; }
+  .top { display: flex; align-items: start; gap: 8px; }
+  h2 { font-size: 17px; margin: 0; flex: 1; }
   h2 a { color: inherit; }
   .plot { position: relative; height: 320px; margin: 12px 0; }
   ul { list-style: none; padding: 0; margin: 0; columns: 2 240px; color: var(--ink2); }
@@ -57,18 +57,22 @@ const DEFAULTS = [
 ];
 const FIDELITY = { '1d': 10, '1w': 60, '1m': 240 }; // minutes per history point
 const TICK = { '1d': 3 * 3600e3, '1w': 86400e3, '1m': 7 * 86400e3 }; // x-axis tick step, ms
+const RANGE_NAME = { '1d': '1 day', '1w': '1 week', '1m': '1 month' };
+const SPAN = { '1d': 86400, '1w': 7 * 86400, '1m': 30 * 86400 }; // seconds
 // dataviz reference palette: categorical in fixed order (9th+ series go gray, never cycled);
-// date ladders use the blue ramp 700 -> 250, near dates dark.
+// date-ladder bars: blue ramp step 250 for the range start, 450 for now.
 const CATEGORICAL = ['#2a78d6', '#eb6834', '#1baf7a', '#eda100', '#e87ba4', '#008300', '#6250d6', '#e34948'];
-const RAMP = ['#0d366b', '#104281', '#184f95', '#1c5cab', '#256abf', '#2a78d6', '#3987e5', '#5598e7', '#6da7ec', '#86b6ef'];
+const BAR_THEN = '#86b6ef', BAR_NOW = '#2a78d6';
 const MUTED = '#898781', GRID = '#ecebe7', INK2 = '#52514e';
 
 const main = document.getElementById('events'), msg = document.getElementById('msg');
 const input = document.getElementById('url');
-let range = '1w', slugs = load();
 
-function load() { try { return JSON.parse(localStorage.getItem('pm.events')) || DEFAULTS; } catch { return DEFAULTS; } }
-function save() { try { localStorage.setItem('pm.events', JSON.stringify(slugs)); } catch {} }
+function load(key, fallback) { try { return JSON.parse(localStorage.getItem(key)) || fallback; } catch { return fallback; } }
+function store(key, value) { try { localStorage.setItem(key, JSON.stringify(value)); } catch {} }
+let range = '1w', slugs = load('pm.events', DEFAULTS);
+const noSide = new Set(load('pm.no', [])); // events switched to show No
+const save = () => { store('pm.events', slugs); store('pm.no', [...noSide]); };
 
 async function getJSON(url) {
   const r = await fetch(url).catch(() => { throw new Error('Could not reach Polymarket.'); });
@@ -77,15 +81,15 @@ async function getJSON(url) {
 }
 const history = (token) =>
   getJSON(`${CLOB}/prices-history?market=${token}&interval=${range}&fidelity=${FIDELITY[range]}`).then((d) => d.history || []);
+// The price at the start of the selected range, or null for a market that opened inside it.
+// Computed once per fetch (not per redraw) so it stays consistent with the history it came from.
+const rangeStart = (m, hist) => startPoint(hist, Date.now() / 1000 - SPAN[range], m.opened);
 
 const pct = (p) => (p * 100).toFixed(1) + '%';
 const fmt = (ms, opts) => new Date(ms).toLocaleString([], opts);
-
-function rampColor(f) { // f in [0,1] along RAMP, mixed between neighbouring steps
-  const x = f * (RAMP.length - 1), i = Math.min(Math.floor(x), RAMP.length - 2), w = x - i;
-  const [a, b] = [RAMP[i], RAMP[i + 1]].map((h) => [1, 3, 5].map((k) => parseInt(h.slice(k, k + 2), 16)));
-  return `rgb(${a.map((v, k) => Math.round(v + (b[k] - v) * w))})`;
-}
+const WHEN = { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' };
+const Y_AXIS = { beginAtZero: true, grid: { color: GRID }, ticks: { color: MUTED, callback: (v) => v + '%' } };
+const LEGEND = { labels: { boxWidth: 10, boxHeight: 10, color: INK2 } };
 
 // Hover: nearest point of every visible line (series have their own timestamps, so 'index' mode won't align).
 Chart.Interaction.modes.eachNearest = (chart, e) => {
@@ -97,10 +101,17 @@ Chart.Interaction.modes.eachNearest = (chart, e) => {
   });
 };
 
-function newChart(canvas) {
+// lines = [{m: market from pickMarkets, hist: [{t, p}], start: rangeStart point or null, color}];
+// val maps a Yes price to the side shown.
+function lineChart(canvas, lines, val) {
   return new Chart(canvas, {
     type: 'line',
-    data: { datasets: [] },
+    data: {
+      datasets: lines.map(({ m, hist, color }) => ({
+        label: m.label, data: hist.map((h) => ({ x: h.t * 1000, y: val(h.p) * 100 })),
+        borderColor: color, backgroundColor: color,
+      })),
+    },
     options: {
       maintainAspectRatio: false,
       animation: false,
@@ -119,15 +130,50 @@ function newChart(canvas) {
             callback: (v) => fmt(v, range === '1d' ? { hour: '2-digit', minute: '2-digit' } : { day: 'numeric', month: 'short' }),
           },
         },
-        y: { beginAtZero: true, grid: { color: GRID }, ticks: { color: MUTED, callback: (v) => v + '%' } },
+        y: Y_AXIS,
       },
       plugins: {
-        legend: { labels: { boxWidth: 10, boxHeight: 10, color: INK2 } },
+        legend: LEGEND,
         tooltip: {
           itemSort: (a, b) => b.parsed.y - a.parsed.y,
           callbacks: {
-            title: (items) => fmt(items[0].parsed.x, { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }),
+            title: (items) => fmt(items[0].parsed.x, WHEN),
             label: (it) => ` ${it.dataset.label}: ${it.parsed.y.toFixed(1)}%`,
+          },
+        },
+      },
+    },
+  });
+}
+
+// Date ladders: one pair of bars per date, range start (line.start: point nearest now − SPAN,
+// none for dates opened inside the range) beside now.
+function barChart(canvas, lines, val) {
+  const start = lines.map((l) => l.start);
+  return new Chart(canvas, {
+    type: 'bar',
+    data: {
+      labels: lines.map((l) => l.m.label),
+      datasets: [
+        { label: `${RANGE_NAME[range]} ago`, data: start.map((h) => (h ? val(h.p) * 100 : null)), backgroundColor: BAR_THEN },
+        { label: 'Now', data: lines.map((l) => val(l.m.price) * 100), backgroundColor: BAR_NOW },
+      ],
+    },
+    options: {
+      maintainAspectRatio: false,
+      animation: false,
+      interaction: { mode: 'index', intersect: false },
+      datasets: { bar: { borderRadius: 4 } },
+      scales: { x: { grid: { display: false }, ticks: { color: MUTED } }, y: Y_AXIS },
+      plugins: {
+        legend: LEGEND,
+        tooltip: {
+          filter: (it) => it.parsed.y != null, // no earlier bar for dates that opened inside the range
+          callbacks: {
+            label: (it) => {
+              const h = it.datasetIndex === 0 && start[it.dataIndex];
+              return ` ${it.dataset.label}${h ? ` (${fmt(h.t * 1000, WHEN)})` : ''}: ${it.parsed.y.toFixed(1)}%`;
+            },
           },
         },
       },
@@ -150,7 +196,13 @@ async function renderEvent(slug) {
   h2.textContent = `Loading ${slug}…`;
   x.setAttribute('aria-label', `Remove ${slug}`);
   let chart;
-  x.onclick = () => { slugs = slugs.filter((s) => s !== slug); save(); card.remove(); chart?.destroy(); };
+  x.onclick = () => {
+    slugs = slugs.filter((s) => s !== slug);
+    noSide.delete(slug);
+    save();
+    card.remove();
+    chart?.destroy();
+  };
   main.append(card);
   const note = (text, cls = '') => card.append(Object.assign(document.createElement('p'), { textContent: text, className: cls }));
 
@@ -165,10 +217,15 @@ async function renderEvent(slug) {
     const { shown, hidden, ladder } = pickMarkets(ev);
     if (!shown.length && !hidden.length) return note('All markets in this event are resolved.');
 
+    // ponytail: No = 1 - Yes (Polymarket's No trades at ~1 - Yes);
+    // fetch the No token's own history (clobTokenIds[1]) if that ever visibly drifts.
+    const val = (p) => (noSide.has(slug) ? 1 - p : p);
+    const sideText = (p) => `${noSide.has(slug) ? 'No ' : ''}${pct(val(p))}`; // say "No" so the list can't be misread
+
     const plot = Object.assign(document.createElement('div'), { className: 'plot' });
     const canvas = document.createElement('canvas');
     canvas.setAttribute('role', 'img');
-    canvas.setAttribute('aria-label', `Chart: ${ev.title} — current values are listed below it`);
+    canvas.setAttribute('aria-label', `Chart: ${ev.title}`);
     plot.append(canvas);
     const list = document.createElement('ul');
     card.append(plot, list);
@@ -176,49 +233,88 @@ async function renderEvent(slug) {
     let failed = 0;
     const histories = await Promise.all(shown.map((m) => history(m.token).catch(() => (failed++, []))));
     if (stale()) return;
-    chart = newChart(canvas);
+    // Bars identify dates by their axis label, so ladder lines need no color.
+    const lines = shown.map((m, i) => ({
+      m, hist: histories[i], start: rangeStart(m, histories[i]), color: ladder ? null : CATEGORICAL[i] || MUTED,
+    }));
+    const hiddenButtons = [];
 
-    const addLine = (m, hist, color) => {
-      chart.data.datasets.push({
-        label: m.label, data: hist.map((h) => ({ x: h.t * 1000, y: h.p * 100 })),
-        borderColor: color, backgroundColor: color,
-      });
-      const c = change24h(hist, m.price), d = c == null ? 0 : Math.round(c * 1000) / 10; // -0.04 -> +0.0, not -0.0
-      const li = document.createElement('li');
-      li.innerHTML = '<i aria-hidden="true"></i><b></b> <span></span>';
-      li.querySelector('i').style.background = color;
-      li.querySelector('b').textContent = m.label;
-      li.querySelector('span').textContent = `${pct(m.price)}, ` +
-        (c == null ? 'no 24h history' : `${d >= 0 ? '+' : '-'}${Math.abs(d).toFixed(1)} pts in 24h`);
-      list.append(li);
+    // Yes/No switch, added only once it works (after the data is in).
+    const sides = document.createElement('span');
+    sides.setAttribute('role', 'group');
+    sides.setAttribute('aria-label', `Show Yes or No for ${ev.title}`);
+    sides.innerHTML = '<button data-s="yes">Yes</button> <button data-s="no">No</button>';
+    x.before(sides);
+
+    const draw = () => {
+      const no = noSide.has(slug);
+      sides.querySelectorAll('button').forEach((b) => b.setAttribute('aria-pressed', (b.dataset.s === 'no') === no));
+      canvas.setAttribute('aria-label', `Chart: ${ev.title}, showing ${no ? 'No' : 'Yes'} — current values are listed below it`);
+      chart?.destroy();
+      chart = (ladder ? barChart : lineChart)(canvas, lines, val);
+      list.replaceChildren(...lines.map(({ m, hist, start, color }) => {
+        const c = change24h(hist.map((h) => ({ t: h.t, p: val(h.p) })), val(m.price));
+        const d = c == null ? 0 : Math.round(c * 1000) / 10; // -0.04 -> +0.0, not -0.0
+        const li = document.createElement('li');
+        li.innerHTML = '<i aria-hidden="true"></i><b></b> <span></span>';
+        if (color) li.querySelector('i').style.background = color;
+        else li.querySelector('i').remove();
+        li.querySelector('b').textContent = m.label;
+        li.querySelector('span').textContent = `${sideText(m.price)}, ` +
+          (c == null ? 'no 24h history' : `${d >= 0 ? '+' : '-'}${Math.abs(d).toFixed(1)} pts in 24h`);
+        if (ladder && hist.length) { // the bar chart's range-start value, as text
+          li.querySelector('span').textContent += start ? `, ${pct(val(start.p))} ${RANGE_NAME[range]} ago`
+            : `, opened ${fmt(m.opened * 1000, { day: 'numeric', month: 'short' })}`;
+        }
+        return li;
+      }));
+      for (const [b, m] of hiddenButtons) b.textContent = `${m.label} ${sideText(m.price)}`;
     };
-    shown.forEach((m, i) => addLine(m, histories[i],
-      ladder ? rampColor(shown.length > 1 ? i / (shown.length - 1) : 0) : CATEGORICAL[i] || MUTED));
-    chart.update();
+    sides.onclick = (e) => {
+      const s = e.target.dataset?.s;
+      if (!s) return;
+      if (s === 'no') noSide.add(slug);
+      else noSide.delete(slug);
+      // not save(): don't rewrite the event list another tab may have changed.
+      // ponytail: pm.no itself is last-tab-wins; re-read it from storage before writing if multi-tab ever matters.
+      store('pm.no', [...noSide]);
+      draw();
+    };
+    draw();
     if (failed) note(`Price history didn't load for ${failed} of ${shown.length} markets. Try Refresh.`, 'err');
 
     if (hidden.length) {
       const d = document.createElement('details');
-      d.innerHTML = `<summary>${hidden.length} more under 1%</summary>`;
+      const summary = (n) => `${n} more (Yes under 1%)`;
+      d.innerHTML = `<summary>${summary(hidden.length)}</summary>`;
       for (const m of hidden) {
         const b = document.createElement('button');
-        b.textContent = `${m.label} ${pct(m.price)}`;
+        hiddenButtons.push([b, m]);
+        b.textContent = `${m.label} ${sideText(m.price)}`;
         b.onclick = async () => {
           b.disabled = true;
           const hist = await history(m.token).catch(() => null);
           if (stale()) return;
           if (!hist) {
             b.disabled = false;
+            b.focus();
             msg.textContent = `Couldn't load ${m.label}. Try again.`;
             return;
           }
-          // ponytail: ladder add-ons go gray at the end, not re-sorted into the ramp (only ladders with <1% dates hit this)
-          addLine(m, hist, ladder ? MUTED : CATEGORICAL[chart.data.datasets.length] || MUTED);
-          chart.update();
+          lines.push({ m, hist, start: rangeStart(m, hist), color: ladder ? null : CATEGORICAL[lines.length] || MUTED });
+          if (ladder) lines.sort((p, q) => p.m.endDate.localeCompare(q.m.endDate));
+          hiddenButtons.splice(hiddenButtons.findIndex(([hb]) => hb === b), 1);
+          const next = b.nextElementSibling || b.previousElementSibling; // keep keyboard focus nearby
           b.remove();
-          const left = d.querySelectorAll('button').length;
-          if (left) d.querySelector('summary').textContent = `${left} more under 1%`;
-          else d.remove();
+          draw();
+          msg.textContent = `Added ${m.label}.`;
+          if (hiddenButtons.length) {
+            d.querySelector('summary').textContent = summary(hiddenButtons.length);
+            next.focus();
+          } else {
+            d.remove();
+            h2.querySelector('a')?.focus();
+          }
         };
         d.append(b);
       }

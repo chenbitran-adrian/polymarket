@@ -1,7 +1,7 @@
 // Run: node --test
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { slugFromInput, pickMarkets, change24h } = require('./lib.js');
+const { slugFromInput, pickMarkets, change24h, startPoint } = require('./lib.js');
 
 const mk = (o) => ({ active: true, closed: false, endDate: '2026-10-28T03:59:00Z', ...o });
 const labels = (ms) => ms.map((m) => m.label);
@@ -28,14 +28,16 @@ test('pickMarkets: candidate event shows open markets >= 1%, sorted by price', (
   const r = pickMarkets({ markets: [
     mk({ groupItemTitle: 'Benjamin Netanyahu', outcomePrices: '["0.335", "0.665"]', clobTokenIds: '["t1", "n1"]' }),
     mk({ groupItemTitle: 'Naftali Bennett', outcomePrices: '["0.0415", "0.9585"]', clobTokenIds: '["t2", "n2"]' }),
-    mk({ groupItemTitle: 'Gadi Eizenkot', outcomePrices: '["0.3795", "0.6205"]', clobTokenIds: '["t3", "n3"]' }),
+    mk({ groupItemTitle: 'Gadi Eizenkot', outcomePrices: '["0.3795", "0.6205"]', clobTokenIds: '["t3", "n3"]', startDate: '2025-11-15T00:27:02Z' }),
     mk({ groupItemTitle: 'Yair Lapid', outcomePrices: '["0.0035", "0.9965"]', clobTokenIds: '["t4", "n4"]' }),
     mk({ groupItemTitle: 'Person H', active: false, clobTokenIds: '["t5", "n5"]' }),
   ] });
   assert.deepEqual(labels(r.shown), ['Gadi Eizenkot', 'Benjamin Netanyahu', 'Naftali Bennett']);
   assert.deepEqual(labels(r.hidden), ['Yair Lapid']);
   assert.equal(r.ladder, false);
-  assert.deepEqual(r.shown[0], { label: 'Gadi Eizenkot', price: 0.3795, token: 't3', endDate: '2026-10-28T03:59:00Z' });
+  assert.deepEqual(r.shown[0], {
+    label: 'Gadi Eizenkot', price: 0.3795, token: 't3', endDate: '2026-10-28T03:59:00Z', opened: Date.parse('2025-11-15T00:27:02Z') / 1000,
+  });
 });
 
 test('pickMarkets: date ladder shows only unresolved dates, in date order', () => {
@@ -65,4 +67,18 @@ test('change24h: current minus the point nearest 24h before the last point', () 
   // history too short to reach 24h back
   assert.equal(change24h([{ t: t0, p: 0.3 }, { t: t0 + 2 * H, p: 0.4 }], 0.4), null);
   assert.equal(change24h([], 0.4), null);
+});
+
+test('startPoint: point nearest the range start; null when the market opened after it', () => {
+  const H = 3600, from = 1_800_000_000, old = from - 90 * 86400;
+  // hourly history with a gap: first point 4.5h after the start -> still the old market's value
+  assert.deepEqual(startPoint([{ t: from + 4.5 * H, p: 0.4 }, { t: from + 10 * H, p: 0.6 }], from, old), { t: from + 4.5 * H, p: 0.4 });
+  // 1m returns ~31 days: the point at the start, not history[0] a day earlier
+  const month = [{ t: from - 86400, p: 0.26 }, { t: from, p: 0.705 }, { t: from + 4 * H, p: 0.8 }];
+  assert.deepEqual(startPoint(month, from, old), { t: from, p: 0.705 });
+  // opened 1h after the start: no price then (its first point is the 50/50 launch quote)
+  assert.equal(startPoint([{ t: from + H, p: 0.5 }, { t: from + 2 * H, p: 0.7 }], from, from + H), null);
+  assert.deepEqual(startPoint(month, from, from), { t: from, p: 0.705 }); // opened exactly at the start counts
+  assert.deepEqual(startPoint(month, from, NaN), { t: from, p: 0.705 }); // no startDate -> treated as old
+  assert.equal(startPoint([], from, old), null);
 });
