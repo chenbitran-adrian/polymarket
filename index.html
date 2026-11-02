@@ -41,8 +41,8 @@
     <button>Add</button>
   </form>
   <div role="group" aria-label="Time range">
-    <button data-r="1d" aria-pressed="false">1 day</button>
-    <button data-r="1w" aria-pressed="true">1 week</button>
+    <button data-r="1d" aria-pressed="true">1 day</button>
+    <button data-r="1w" aria-pressed="false">1 week</button>
     <button data-r="1m" aria-pressed="false">1 month</button>
   </div>
   <button id="refresh">Refresh</button>
@@ -51,9 +51,10 @@
 <main id="events"></main>
 <script>
 const GAMMA = 'https://gamma-api.polymarket.com', CLOB = 'https://clob.polymarket.com';
+const CEASEFIRE = 'israel-x-iran-ceasefire-continues-throughptptpt-20260716224448963';
 const DEFAULTS = [
   'who-will-be-the-next-prime-minister-of-israel-after-the-next-election',
-  'israel-x-iran-ceasefire-continues-throughptptpt-20260716224448963',
+  CEASEFIRE,
 ];
 const FIDELITY = { '1d': 10, '1w': 60, '1m': 240 }; // minutes per history point
 const TICK = { '1d': 3 * 3600e3, '1w': 86400e3, '1m': 7 * 86400e3 }; // x-axis tick step, ms
@@ -70,9 +71,12 @@ const input = document.getElementById('url');
 
 function load(key, fallback) { try { return JSON.parse(localStorage.getItem(key)) || fallback; } catch { return fallback; } }
 function store(key, value) { try { localStorage.setItem(key, JSON.stringify(value)); } catch {} }
-let range = '1w', slugs = load('pm.events', DEFAULTS);
-const noSide = new Set(load('pm.no', [])); // events switched to show No
-const save = () => { store('pm.events', slugs); store('pm.no', [...noSide]); };
+let range = '1d', slugs = load('pm.events', DEFAULTS);
+// Events switched to show No; ceasefire starts on No. Key is v2 because v1 ('pm.no') was written as []
+// by any add/remove in earlier versions, which would hide the new default on browsers that used them.
+const NO_KEY = 'pm.no.v2';
+const noSide = new Set(load(NO_KEY, [CEASEFIRE]));
+const save = () => { store('pm.events', slugs); store(NO_KEY, [...noSide]); };
 
 async function getJSON(url) {
   const r = await fetch(url).catch(() => { throw new Error('Could not reach Polymarket.'); });
@@ -276,8 +280,8 @@ async function renderEvent(slug) {
       if (s === 'no') noSide.add(slug);
       else noSide.delete(slug);
       // not save(): don't rewrite the event list another tab may have changed.
-      // ponytail: pm.no itself is last-tab-wins; re-read it from storage before writing if multi-tab ever matters.
-      store('pm.no', [...noSide]);
+      // ponytail: the No list itself is last-tab-wins; re-read it from storage before writing if multi-tab ever matters.
+      store(NO_KEY, [...noSide]);
       draw();
     };
     draw();
